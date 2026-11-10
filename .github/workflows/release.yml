@@ -71,7 +71,7 @@ jobs:
                       output.write(f"version={current if tag else ''}\n")
 
             - name: Check publishing credentials
-              if: github.event_name == 'push'
+              if: github.event_name == 'push' && !github.event.repository.fork
               env:
                   RELEASE_TAG: ${{ steps.version.outputs.tag }}
                   PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
@@ -86,6 +86,12 @@ jobs:
                       echo "::error::Set the TEST_PYPI_TOKEN repository secret to publish development builds."
                       exit 1
                   fi
+
+            - name: Explain build-only mode
+              if: github.event_name == 'workflow_dispatch' || github.event.repository.fork
+              run: |
+                  echo "Build-only run: validate distributions and upload artifacts without publishing."
+                  echo "Fork and manual runs do not require PyPI credentials or create release notes." >> "$GITHUB_STEP_SUMMARY"
 
             # This changes only the disposable runner checkout, never the repository.
             - name: Set development build version
@@ -107,14 +113,18 @@ jobs:
                   if-no-files-found: error
 
             - name: Publish package on PyPI
-              if: github.event_name == 'push' && steps.version.outputs.tag != ''
+              if: >-
+                  github.event_name == 'push' && !github.event.repository.fork &&
+                  steps.version.outputs.tag != ''
               uses: pypa/gh-action-pypi-publish@release/v1
               with:
                   password: ${{ secrets.PYPI_TOKEN }}
                   attestations: false
 
             - name: Publish package on TestPyPI
-              if: github.event_name == 'push' && steps.version.outputs.tag == ''
+              if: >-
+                  github.event_name == 'push' && !github.event.repository.fork &&
+                  steps.version.outputs.tag == ''
               uses: pypa/gh-action-pypi-publish@release/v1
               with:
                   password: ${{ secrets.TEST_PYPI_TOKEN }}
@@ -123,7 +133,7 @@ jobs:
 
             # Release Drafter creates the tag only after a successful PyPI upload.
             - name: Publish or draft release notes
-              if: github.event_name == 'push'
+              if: github.event_name == 'push' && !github.event.repository.fork
               uses: release-drafter/release-drafter@v6.0.0
               with:
                   publish: ${{ steps.version.outputs.tag != '' }}
