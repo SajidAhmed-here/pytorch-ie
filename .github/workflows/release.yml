@@ -3,11 +3,20 @@ name: Release
 on:
     push:
         branches: [main, master]
+    # Manual runs only build and validate; they never publish or create tags.
+    workflow_dispatch:
+
+permissions:
+    contents: read
 
 jobs:
     release:
-        name: Release
+        name: Build and release
         runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: write
+            pull-requests: read
         steps:
             - name: Check out the repository
               uses: actions/checkout@v4
@@ -19,59 +28,108 @@ jobs:
               with:
                   python-version: "3.10"
 
-            - name: Upgrade pip
+            - name: Install build tools
               run: |
-                  pip install --constraint=.github/workflows/constraints.txt pip
-                  pip --version
+                  python -m pip install --constraint=.github/workflows/constraints.txt pip
+                  python -m pip install poetry==2.1.3 poetry-plugin-export==1.9.0 twine==6.1.0 tomli==2.2.1
 
-            - name: Install Poetry
-              uses: snok/install-poetry@v1
-              with:
-                  version: latest
-                  virtualenvs-in-project: true
+            # Building does not require installing torch or the development dependencies.
+            - name: Validate project metadata and lockfile
+              run: poetry check --lock
 
-            - name: Check if there is a parent commit
-              id: check-parent-commit
+            - name: Detect a version change
+              id: version
+              shell: python
               run: |
-                  echo "sha=$(git rev-parse --verify --quiet HEAD^)" >> "$GITHUB_OUTPUT"
+                  import os
+                  import subprocess
+                  from pathlib import Path
 
-            - name: Detect and tag new version
-              id: check-version
-              if: steps.check-parent-commit.outputs.sha
-              uses: salsify/action-detect-and-tag-new-version@v2.0.3
-              with:
-                  version-command: |
-                      bash -o pipefail -c "poetry version -s"
+                  import tomli
+                  from packaging.version import Version
 
-            - name: Bump version for developmental release
-              if: "! steps.check-version.outputs.tag"
+                  def read_version(text):
+                      metadata = tomli.loads(text)
+                      return metadata.get("project", {}).get("version") or metadata["tool"]["poetry"]["version"]
+
+                  current = read_version(Path("pyproject.toml").read_text(encoding="utf-8"))
+                  parent = subprocess.run(
+                      ["git", "rev-parse", "--verify", "--quiet", "HEAD^"],
+                      capture_output=True, text=True, check=False,
+                  )
+                  tag = ""
+                  if parent.returncode == 0:
+                      previous = read_version(subprocess.check_output(
+                          ["git", "show", "HEAD^:pyproject.toml"], text=True,
+                      ))
+                      if Version(current) < Version(previous):
+                          raise SystemExit("The package version must not decrease.")
+                      if Version(current) > Version(previous):
+                          tag = f"v{current}"
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write(f"tag={tag}\n")
+                      output.write(f"version={current if tag else ''}\n")
+
+            - name: Check publishing credentials
+              if: github.event_name == 'push'
+              env:
+                  RELEASE_TAG: ${{ steps.version.outputs.tag }}
+                  PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+                  TEST_PYPI_TOKEN: ${{ secrets.TEST_PYPI_TOKEN }}
+              run: |
+                  if [[ -n "$RELEASE_TAG" ]]; then
+                      if [[ -z "$PYPI_TOKEN" ]]; then
+                          echo "::error::Set the PYPI_TOKEN repository secret to publish releases."
+                          exit 1
+                      fi
+                  elif [[ -z "$TEST_PYPI_TOKEN" ]]; then
+                      echo "::error::Set the TEST_PYPI_TOKEN repository secret to publish development builds."
+                      exit 1
+                  fi
+
+            # This changes only the disposable runner checkout, never the repository.
+            - name: Set development build version
+              if: steps.version.outputs.tag == ''
               run: |
                   poetry version patch
-                  poetry version "$(poetry version -s).dev.$(date -u +%s)"
+                  poetry version "$(poetry version -s).dev$(date -u +%s)"
 
-            - name: Build package
-              run: poetry build --ansi
+            - name: Build and validate distributions
+              run: |
+                  poetry build --no-interaction
+                  python -m twine check --strict dist/*
+
+            - name: Store distributions
+              uses: actions/upload-artifact@v4
+              with:
+                  name: distributions-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: dist/*
+                  if-no-files-found: error
 
             - name: Publish package on PyPI
-              if: steps.check-version.outputs.tag
+              if: github.event_name == 'push' && steps.version.outputs.tag != ''
               uses: pypa/gh-action-pypi-publish@release/v1
               with:
-                  user: __token__
                   password: ${{ secrets.PYPI_TOKEN }}
+                  attestations: false
 
             - name: Publish package on TestPyPI
-              if: "! steps.check-version.outputs.tag"
+              if: github.event_name == 'push' && steps.version.outputs.tag == ''
               uses: pypa/gh-action-pypi-publish@release/v1
               with:
-                  user: __token__
                   password: ${{ secrets.TEST_PYPI_TOKEN }}
                   repository-url: https://test.pypi.org/legacy/
-                  verbose: true
+                  attestations: false
 
-            - name: Publish the release notes
+            # Release Drafter creates the tag only after a successful PyPI upload.
+            - name: Publish or draft release notes
+              if: github.event_name == 'push'
               uses: release-drafter/release-drafter@v6.0.0
               with:
-                  publish: ${{ steps.check-version.outputs.tag != '' }}
-                  tag: ${{ steps.check-version.outputs.tag }}
+                  publish: ${{ steps.version.outputs.tag != '' }}
+                  tag: ${{ steps.version.outputs.tag }}
+                  version: ${{ steps.version.outputs.version }}
+                  commitish: ${{ github.sha }}
+                  disable-autolabeler: true
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
